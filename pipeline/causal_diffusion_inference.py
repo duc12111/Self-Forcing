@@ -88,6 +88,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         unconditional_dict = self.text_encoder(
             text_prompts=[self.args.negative_prompt] * len(text_prompts)
         )
+        # Ensure embeddings are on the same device/dtype as noise (works for both low/high memory)
+        for key, value in conditional_dict.items():
+            conditional_dict[key] = value.to(device=noise.device, dtype=noise.dtype)
+        for key, value in unconditional_dict.items():
+            unconditional_dict[key] = value.to(device=noise.device, dtype=noise.dtype)
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],

@@ -183,6 +183,33 @@ class VAEDecoderWrapper(nn.Module):
         out = out.permute(0, 2, 1, 3, 4)
         return out, feat_cache
 
+    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+        """
+        Decode latent tensor to pixel space.
+        
+        Args:
+            latent: [batch_size, num_frames, num_channels, height, width]
+            use_cache: Whether to use caching (always False for VAEDecoderWrapper)
+            
+        Returns:
+            pixel: [batch_size, num_frames, num_channels, height, width]
+        """
+        # Use the forward method which already handles the decoding
+        from demo_utils.constant import ZERO_VAE_CACHE
+        
+        # Initialize cache if needed
+        vae_cache = ZERO_VAE_CACHE
+        for i in range(len(vae_cache)):
+            vae_cache[i] = vae_cache[i].to(device=latent.device, dtype=latent.dtype)
+        
+        # Call forward method
+        output, _ = self.forward(latent, *vae_cache)
+        return output
+    
+    def clear_cache(self):
+        """Clear VAE cache - compatibility method"""
+        pass
+
 
 class VAEDecoder3d(nn.Module):
     def __init__(self,

@@ -84,16 +84,24 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        # Ensure embeddings are on the same device/dtype as noise (works for both low/high memory)
+        for key, value in conditional_dict.items():
+            conditional_dict[key] = value.to(device=noise.device, dtype=noise.dtype)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
             move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
-
-        output = torch.zeros(
-            [batch_size, num_output_frames, num_channels, height, width],
-            device=noise.device,
-            dtype=noise.dtype
-        )
+            # In low memory mode, use a list to collect blocks instead of pre-allocating huge tensor
+            output_blocks = []
+            output = None
+        else:
+            # Only allocate full output tensor in high memory mode
+            output = torch.zeros(
+                [batch_size, num_output_frames, num_channels, height, width],
+                device=noise.device,
+                dtype=noise.dtype
+            )
+            output_blocks = None
 
         # Set up profiling if requested
         if profile:
@@ -139,7 +147,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
                 assert (num_input_frames - 1) % self.num_frame_per_block == 0
                 num_input_blocks = (num_input_frames - 1) // self.num_frame_per_block
-                output[:, :1] = initial_latent[:, :1]
+                if low_memory:
+                    output_blocks.append(initial_latent[:, :1])
+                else:
+                    output[:, :1] = initial_latent[:, :1]
                 self.generator(
                     noisy_image_or_video=initial_latent[:, :1],
                     conditional_dict=conditional_dict,
@@ -157,7 +168,10 @@ class CausalInferencePipeline(torch.nn.Module):
             for _ in range(num_input_blocks):
                 current_ref_latents = \
                     initial_latent[:, current_start_frame:current_start_frame + self.num_frame_per_block]
-                output[:, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
+                if low_memory:
+                    output_blocks.append(current_ref_latents)
+                else:
+                    output[:, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
                 self.generator(
                     noisy_image_or_video=current_ref_latents,
                     conditional_dict=conditional_dict,
@@ -186,7 +200,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
-                print(f"current_timestep: {current_timestep}")
+                # print(f"current_timestep: {current_timestep}")  # Commented out noisy debug output
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -221,7 +235,10 @@ class CausalInferencePipeline(torch.nn.Module):
                     )
 
             # Step 3.2: record the model's output
-            output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+            if low_memory:
+                output_blocks.append(denoised_pred)
+            else:
+                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
@@ -271,6 +288,9 @@ class CausalInferencePipeline(torch.nn.Module):
             print(f"  - Total time: {total_time:.2f} ms")
 
         if return_latents:
+            if low_memory:
+                # Concatenate output blocks on the fly for low memory mode
+                output = torch.cat(output_blocks, dim=1) if output_blocks else None
             return video, output
         else:
             return video

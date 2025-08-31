@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from demo_utils.memory import gpu, get_cuda_free_memory_gb
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
@@ -15,30 +16,85 @@ class WanTextEncoder(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
+        print("    - Creating UMT5 model architecture...")
+        # Decide device: use GPU when we have sufficient VRAM (20GB+), CPU otherwise
+        free_vram_gb = get_cuda_free_memory_gb(gpu)
+        low_memory = free_vram_gb < 20  # Lower threshold for GPU usage
+        target_device = 'cuda' if not low_memory else 'cpu'
+        # Use bf16 for GPU, fp32 for CPU to avoid precision issues
+        target_dtype = torch.bfloat16 if target_device == 'cuda' else torch.float32
+
         self.text_encoder = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
-            dtype=torch.float32,
-            device=torch.device('cpu')
+            dtype=target_dtype,
+            device=target_device
         ).eval().requires_grad_(False)
-        self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
-        )
+        print("    - UMT5 model architecture created")
+        
+        print("    - Loading 11GB model weights from disk...")
+        
+        # Optimized loading approach for low memory mode
+        import os
+        import shutil
+        
+        model_path = "wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"
+        cached_path = "/tmp/models_t5_umt5-xxl-enc-bf16_cached.pth"
+        
+        # Check for pre-cached file first
+        if os.path.exists(cached_path):
+            file_size_gb = os.path.getsize(cached_path) / (1024**3)
+            print(f"      - Found cached model in local storage ({file_size_gb:.1f}GB)")
+            print(f"      - Loading from: {cached_path}")
+            state_dict = torch.load(cached_path, map_location=target_device, weights_only=False)
+        else:
+            # For low memory mode, load directly without copying to save time and disk space
+            if low_memory:
+                print(f"      - Loading directly from original location (low memory mode)")
+                print(f"      - From: {model_path}")
+                state_dict = torch.load(model_path, map_location=target_device, weights_only=False)
+            else:
+                # Copy to local storage for faster loading (high memory mode only)
+                file_size_gb = os.path.getsize(model_path) / (1024**3)
+                print(f"      - Copying {file_size_gb:.1f}GB model to local storage for permanent cache...")
+                print(f"      - From: {model_path}")
+                print(f"      - To: {cached_path}")
+                shutil.copy2(model_path, cached_path)
+                print(f"      - Copy completed, loading from cached location...")
+                
+                # Load from cached copy
+                state_dict = torch.load(cached_path, map_location=target_device, weights_only=False)
+        
+        print("      - Applying state dict to model...")
+        self.text_encoder.load_state_dict(state_dict)
+        
+        # Clean up to free memory
+        del state_dict
+        import gc
+        gc.collect()
+        
+        print("    - Model weights loaded successfully")
 
+        print("    - Initializing tokenizer...")
         self.tokenizer = HuggingfaceTokenizer(
             name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+        print("    - Tokenizer initialized")
 
     @property
     def device(self):
-        # Assume we are always on GPU
-        return torch.cuda.current_device()
+        # Return actual device of the encoder parameters (no try/except)
+        for p in self.text_encoder.parameters():
+            return p.device
+        return torch.device('cpu')
 
     def forward(self, text_prompts: List[str]) -> dict:
         ids, mask = self.tokenizer(
             text_prompts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
-        mask = mask.to(self.device)
+        # Align token tensors to the live device of the token embedding.
+        # This is crucial when DynamicSwap moves the encoder to CUDA at call time.
+        embedding_device = getattr(self.text_encoder.token_embedding.weight, 'device', self.device)
+        ids = ids.to(embedding_device)
+        mask = mask.to(embedding_device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.text_encoder(ids, mask)
 
@@ -227,7 +283,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
-        prompt_embeds = conditional_dict["prompt_embeds"]
+        # Align conditioning to the same device/dtype as inputs to avoid CPU/CUDA mismatches
+        input_device = noisy_image_or_video.device
+        input_dtype = noisy_image_or_video.dtype
+        prompt_embeds = conditional_dict["prompt_embeds"].to(device=input_device, dtype=input_dtype)
 
         # [B, F] -> [B]
         if self.uniform_timestep:

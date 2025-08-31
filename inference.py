@@ -1,6 +1,7 @@
 import argparse
 import torch
 import os
+import time
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
@@ -17,6 +18,10 @@ from pipeline import (
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
+# OPTIMIZATION: Import optimized components from demo.py
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from demo_utils.vae_block3 import VAEDecoderWrapper
+from demo_utils.constant import ZERO_VAE_CACHE
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
 parser = argparse.ArgumentParser()
@@ -49,8 +54,29 @@ else:
     world_size = 1
     set_seed(args.seed)
 
-print(f'Free VRAM {get_cuda_free_memory_gb(gpu)} GB')
-low_memory = get_cuda_free_memory_gb(gpu) < 40
+# OPTIMIZATION: Aggressive memory cleanup at start
+torch.cuda.empty_cache()
+import gc
+gc.collect()
+
+free_vram_gb = get_cuda_free_memory_gb(gpu)
+print(f'Free VRAM {free_vram_gb} GB')
+
+# OPTIMIZATION: Enhanced memory mode detection (from demo.py)
+if free_vram_gb < 6.0:
+    print("⚠️ Using minimal memory mode due to very limited VRAM")
+    low_memory = True
+    minimal_memory = True
+elif free_vram_gb < 20.0:
+    print("⚠️ Using optimized low memory mode for 15GB VRAM (encoder+VAE on GPU, transformer dynamic)")
+    low_memory = True
+    minimal_memory = False
+else:
+    print("✅ Using high memory mode (all models on GPU)")
+    low_memory = False
+    minimal_memory = False
+
+print(f"✅ Memory mode: {'minimal' if minimal_memory else ('optimized low' if low_memory else 'high')} memory mode")
 
 torch.set_grad_enabled(False)
 
@@ -58,25 +84,149 @@ config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
-# Initialize pipeline
+# OPTIMIZATION: Load models using optimized wrappers (like demo.py)
+print("Loading text encoder...")
+print("  - Initializing UMT5 model...")
+torch.cuda.empty_cache()
+text_encoder = WanTextEncoder()
+print("✅ Text encoder loaded successfully")
+
+print("Loading transformer model...")
+print("  - Initializing WanDiffusionWrapper...")
+transformer = WanDiffusionWrapper(is_causal=True)
+print("  - Loading checkpoint weights...")
+
+# OPTIMIZATION: Optimized checkpoint loading (from demo.py)
+if args.checkpoint_path:
+    if low_memory:
+        print("  - Using CPU loading due to low memory...")
+        state_dict = torch.load(args.checkpoint_path, map_location="cpu")
+    else:
+        print("  - Loading directly to GPU...")
+        state_dict = torch.load(args.checkpoint_path, map_location=gpu)
+
+    print("  - Applying weights to model...")
+    # Check what keys are available in the checkpoint
+    print(f"📋 Checkpoint keys: {list(state_dict.keys())}")
+    
+    # Use generator_ema by default since that's what's available
+    if 'generator_ema' in state_dict:
+        print("✅ Loading generator_ema from checkpoint")
+        transformer.load_state_dict(state_dict['generator_ema'])
+    elif 'generator' in state_dict:
+        print("✅ Loading generator from checkpoint")
+        transformer.load_state_dict(state_dict['generator'])
+    else:
+        raise KeyError(f"No generator key found in checkpoint. Available keys: {list(state_dict.keys())}")
+
+    # Clean up state dict to free memory
+    del state_dict
+    gc.collect()
+print("✅ Transformer model loaded successfully")
+
+# OPTIMIZATION: Initialize VAE decoder using optimized wrapper
+print("Loading VAE decoder...")
+vae_decoder = VAEDecoderWrapper()
+
+# OPTIMIZATION: Optimized VAE loading (from demo.py)
+if low_memory:
+    print("  - Using CPU loading for VAE due to low memory...")
+    vae_state_dict = torch.load('wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth', map_location="cpu")
+else:
+    print("  - Loading VAE directly to GPU...")
+    vae_state_dict = torch.load('wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth', map_location=gpu)
+
+decoder_state_dict = {}
+for key, value in vae_state_dict.items():
+    if 'decoder.' in key or 'conv2' in key:
+        decoder_state_dict[key] = value
+vae_decoder.load_state_dict(decoder_state_dict)
+
+# Clean up to free memory
+del vae_state_dict, decoder_state_dict
+gc.collect()
+
+vae_decoder.eval()
+vae_decoder.to(dtype=torch.bfloat16)
+vae_decoder.requires_grad_(False)
+
+# Only move to GPU if not already there (for CPU-loaded models)
+if low_memory:
+    print("  - Moving VAE decoder to GPU (loaded from CPU)...")
+    vae_decoder.to(gpu)
+else:
+    print("  - VAE decoder already on GPU (loaded directly)")
+
+print("✅ VAE decoder loaded successfully")
+
+print("Setting up model configurations...")
+text_encoder.eval()
+transformer.eval()
+
+transformer.to(dtype=torch.bfloat16)
+text_encoder.to(dtype=torch.bfloat16)
+
+text_encoder.requires_grad_(False)
+transformer.requires_grad_(False)
+
+print("Initializing pipeline...")
+# OPTIMIZATION: Use GPU for pipeline device
+pipeline_device = gpu
+# Initialize pipeline using optimized components
 if hasattr(config, 'denoising_step_list'):
     # Few-step inference
-    pipeline = CausalInferencePipeline(config, device=device)
+    pipeline = CausalInferencePipeline(
+        config,
+        device=pipeline_device,
+        generator=transformer,
+        text_encoder=text_encoder,
+        vae=vae_decoder
+    )
 else:
     # Multi-step diffusion inference
-    pipeline = CausalDiffusionInferencePipeline(config, device=device)
+    pipeline = CausalDiffusionInferencePipeline(
+        config,
+        device=pipeline_device,
+        generator=transformer,
+        text_encoder=text_encoder,
+        vae=vae_decoder
+    )
 
-if args.checkpoint_path:
-    state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-    pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
+print("Moving models to GPU...")
+# OPTIMIZATION: Clear memory before moving models
+torch.cuda.empty_cache()
 
-pipeline = pipeline.to(dtype=torch.bfloat16)
-if low_memory:
-    DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
+if minimal_memory:
+    print("  - MINIMAL MEMORY MODE: Only VAE on GPU, others move dynamically...")
+    vae_decoder.to(gpu)
+    print("  - VAE decoder moved to GPU (essential for output)")
+    print("  - Text encoder staying on CPU (moved temporarily during generation)")
+    print("  - Transformer staying on CPU (moved temporarily during generation)")
+elif low_memory:
+    print("  - OPTIMIZED LOW MEMORY MODE: Text encoder + VAE on GPU, transformer dynamic...")
+    text_encoder.to(gpu)
+    print("  - Text encoder moved to GPU (~6GB)")
+    print("  - Transformer staying on CPU (moved dynamically during generation)")
+    vae_decoder.to(gpu)
+    print("  - VAE decoder moved to GPU (~1-2GB)")
+    estimated_usage = 6 + 1.5  # Text encoder + VAE only
+    print(f"  - Estimated GPU usage: ~{estimated_usage}GB base models")
+    print(f"  - Peak usage during generation: ~{estimated_usage + 6}GB (transformer temporarily loaded)")
 else:
-    pipeline.text_encoder.to(device=gpu)
-pipeline.generator.to(device=gpu)
-pipeline.vae.to(device=gpu)
+    print("  - HIGH MEMORY MODE: Moving all models to GPU...")
+    text_encoder.to(gpu)
+    transformer.to(gpu)
+    vae_decoder.to(gpu)
+    print("  - All models moved to GPU")
+
+# OPTIMIZATION: Apply DynamicSwapInstaller for memory optimization
+if low_memory or minimal_memory:
+    print("  - Installing DynamicSwapInstaller for text encoder...")
+    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+
+# Final memory cleanup
+torch.cuda.empty_cache()
+print("✅ All models loaded and ready!")
 
 
 # Create dataset
@@ -106,6 +256,12 @@ if local_rank == 0:
 if dist.is_initialized():
     dist.barrier()
 
+# OPTIMIZATION: Pre-initialize VAE cache
+vae_cache = ZERO_VAE_CACHE
+for i in range(len(vae_cache)):
+    vae_cache[i] = vae_cache[i].to(device=gpu, dtype=torch.bfloat16)
+print(f"✅ VAE cache initialized: {len(vae_cache)} items")
+
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
     device, dtype = videos[0].device, videos[0].dtype
@@ -122,6 +278,14 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
+    
+    print(f"\n🎬 Processing prompt {i+1}/{num_prompts} (index {idx})")
+
+    # OPTIMIZATION: Move transformer to GPU before generation if in memory-optimized mode
+    if minimal_memory or low_memory:
+        print(f"  - Moving transformer to GPU for generation...")
+        transformer.to(gpu)
+        torch.cuda.empty_cache()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
     # Unpack the batch data for convenience
@@ -137,13 +301,18 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         # For image-to-video, batch contains image and caption
         prompt = batch['prompts'][0]  # Get caption from batch
         prompts = [prompt] * args.num_samples
+        print(f"📝 Text prompt: {prompt[:100]}...")
+        print(f"🖼️ Processing image-to-video generation...")
 
         # Process the image
+        print("  - Loading image to tensor...")
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
 
         # Encode the input image as the first latent
+        print("  - Encoding image as initial latent...")
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
         initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
+        print(f"  ✅ Image encoded: {initial_latent.shape}")
 
         sampled_noise = torch.randn(
             [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
@@ -154,15 +323,30 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
             prompts = [extended_prompt] * args.num_samples
+            print(f"📝 Extended prompt: {extended_prompt[:100]}...")
         else:
             prompts = [prompt] * args.num_samples
+            print(f"📝 Text prompt: {prompt[:100]}...")
         initial_latent = None
 
         sampled_noise = torch.randn(
             [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    # Generate 81 frames
+    print(f"🎲 Generated noise tensor: {sampled_noise.shape}")
+    
+    # Clear GPU memory before generation
+    print("🧹 Clearing GPU memory before generation...")
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    free_vram = get_cuda_free_memory_gb(gpu)
+    print(f"✅ GPU memory cleared. Free VRAM: {free_vram:.2f} GB")
+
+    # Generate frames
+    print("🚀 Starting video generation...")
+    generation_start_time = time.time()
+    
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -170,15 +354,22 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         initial_latent=initial_latent,
         low_memory=low_memory,
     )
+    
+    generation_time = time.time() - generation_start_time
+    print(f"⚡ Generation completed in {generation_time:.2f}s")
+    
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
 
     # Final output video
+    print("🎨 Processing final video...")
     video = 255.0 * torch.cat(all_video, dim=1)
+    print(f"✅ Video processed: {video.shape}")
 
     # Clear VAE cache
-    pipeline.vae.model.clear_cache()
+    print("🧹 Clearing VAE cache...")
+    pipeline.vae.clear_cache()
 
     # Save the video if the current prompt is not a dummy prompt
     if idx < num_prompts:
@@ -189,4 +380,19 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
             else:
                 output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
+            print(f"💾 Saving video to: {output_path}")
             write_video(output_path, video[seed_idx], fps=16)
+            print(f"✅ Video saved successfully!")
+    
+    # OPTIMIZATION: Move transformer back to CPU if in memory-optimized mode
+    if minimal_memory or low_memory:
+        print(f"  - Moving transformer back to CPU after generation...")
+        transformer.to('cpu')
+        torch.cuda.empty_cache()
+        free_vram = get_cuda_free_memory_gb(gpu)
+        print(f"  - GPU memory freed. Free VRAM: {free_vram:.2f} GB")
+    
+    # Clear GPU memory after each generation
+    print("🧹 Clearing GPU memory after generation...")
+    torch.cuda.empty_cache()
+    print(f"✅ GPU memory cleared. Free VRAM: {get_cuda_free_memory_gb(gpu):.2f} GB")

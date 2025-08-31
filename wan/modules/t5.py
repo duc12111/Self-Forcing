@@ -285,20 +285,27 @@ class T5Encoder(nn.Module):
         self.num_buckets = num_buckets
         self.shared_pos = shared_pos
 
+        print(f"        - Creating token embedding (vocab={vocab}, dim={dim})...")
         # layers
         self.token_embedding = vocab if isinstance(vocab, nn.Embedding) \
             else nn.Embedding(vocab, dim)
+        
+        print(f"        - Creating position embedding...")
         self.pos_embedding = T5RelativeEmbedding(
             num_buckets, num_heads, bidirectional=True) if shared_pos else None
         self.dropout = nn.Dropout(dropout)
+        
+        print(f"        - Creating {num_layers} attention blocks...")
         self.blocks = nn.ModuleList([
             T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
                             shared_pos, dropout) for _ in range(num_layers)
         ])
         self.norm = T5LayerNorm(dim)
 
+        print(f"        - Initializing weights...")
         # initialize weights
         self.apply(init_weights)
+        print(f"        - T5Encoder initialization complete")
 
     def forward(self, ids, mask=None):
         x = self.token_embedding(ids)
@@ -438,11 +445,15 @@ def _t5(name,
         model_cls = T5Model
 
     # init model
+    print(f"      - Creating {model_cls.__name__} with {kwargs.get('num_layers', 'unknown')} layers...")
     with torch.device(device):
         model = model_cls(**kwargs)
+    print(f"      - {model_cls.__name__} architecture created")
 
     # set device
+    print(f"      - Moving model to {device} with {dtype}...")
     model = model.to(dtype=dtype, device=device)
+    print(f"      - Model moved to {device}")
 
     # init tokenizer
     if return_tokenizer:
